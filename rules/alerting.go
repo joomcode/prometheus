@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +28,12 @@ import (
 	"go.uber.org/atomic"
 	"gopkg.in/yaml.v2"
 
+	apic "github.com/prometheus/client_golang/api"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/model/timestamp"
+
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
@@ -321,12 +325,56 @@ func (r *AlertingRule) Restored() bool {
 // is kept in memory state and consequently repeatedly sent to the AlertManager.
 const resolvedRetention = 15 * time.Minute
 
+func modelToPromql(mv model.Vector) promql.Vector {
+	var vec promql.Vector
+
+	for _, m := range mv {
+		b := labels.NewBuilder(labels.Labels{})
+		for n, v := range m.Metric {
+			b.Set(string(n), string(v))
+		}
+		vec = append(vec, promql.Sample{
+			T:      int64(m.Timestamp),
+			F:      float64(m.Value),
+			Metric: b.Labels(),
+		})
+	}
+	return vec
+}
+
+func vmQueryAlerting(ctx context.Context, rule *AlertingRule, ts time.Time) (promql.Vector, error) {
+	vmURL, ok := os.LookupEnv("VMSELECT_URL")
+	if !ok {
+		level.Warn(rule.logger).Log("FATAL: evironment variable VMSELECT_URL doesn't exists")
+		os.Exit(-1)
+	}
+	client, err := apic.NewClient(apic.Config{Address: vmURL})
+	if err != nil {
+		return nil, err
+	}
+
+	//stime := time.Now()
+	queryAPI := v1.NewAPI(client)
+	//fmt.Println("Evaluating:", time.Since(stime), rule.vector.String())
+	value, _, err := queryAPI.Query(context.Background(), rule.vector.String(), time.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	if _, ok := value.(model.Vector); !ok {
+		err := fmt.Errorf("returned value is not a vector")
+		return nil, err
+	}
+	return modelToPromql(value.(model.Vector)), nil
+}
+
 // Eval evaluates the rule expression and then creates pending alerts and fires
 // or removes previously pending alerts accordingly.
 func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, externalURL *url.URL, limit int) (promql.Vector, error) {
 	ctx = NewOriginContext(ctx, NewRuleDetail(r))
 
-	res, err := query(ctx, r.vector.String(), ts)
+	//res, err := query(ctx, r.vector.String(), ts)
+	res, err := vmQueryAlerting(ctx, r, ts)
 	if err != nil {
 		return nil, err
 	}
